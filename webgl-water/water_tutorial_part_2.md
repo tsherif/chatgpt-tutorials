@@ -512,6 +512,8 @@ window.onload = function() {
 
 function animate() {
 
+  gl.disable(gl.DEPTH_TEST);
+
   water.stepSimulation();
   water.stepSimulation();
   water.updateNormals();
