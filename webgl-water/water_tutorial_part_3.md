@@ -258,6 +258,8 @@ window.onload = function() {
 
 function animate() {
 
+  gl.disable(gl.DEPTH_TEST);
+
   water.stepSimulation();
   water.stepSimulation();
   water.updateNormals();
@@ -335,6 +337,8 @@ window.onload = function() {
 };
 
 function animate() {
+
+  gl.disable(gl.DEPTH_TEST);
 
   water.stepSimulation();
   water.stepSimulation();
@@ -575,21 +579,293 @@ function Renderer() {
 
 Let’s break down the new constructor into the parts that matter.
 
-## 5.1 — Shared helper block
+## 5.1 — Shared Helper Block
 
 ```javascript
 var helperFunctions = '...';
 ```
 
-This block is prepended to both fragment shaders.
+This shared GLSL block contains the utility code that both water fragment shaders need.
 
-That is where we define:
+That includes three helper functions:
 
-- IOR constants
-- box intersection logic
-- a helper that decides what color a ray sees
+- `intersectBox(...)`
+- `poolColor(...)`
+- `traceSceneColor(...)`
 
-This avoids duplicating those definitions in both shader variants.
+Together they answer a very practical question:
+
+> once we compute a reflected or refracted ray, what color should that ray see?
+
+Instead of putting all of that logic directly inside the main fragment shader, we package it into helpers so the shader can stay focused on the optical steps:
+
+1. reconstruct the normal  
+2. compute the view ray  
+3. compute reflected and refracted rays  
+4. ask the helpers what colors those rays see  
+5. blend the results with Fresnel
+
+Let’s look at the three helpers one by one.
+
+---
+
+### `intersectBox(origin, ray, boxMin, boxMax)`
+
+```glsl
+vec2 intersectBox(vec3 origin, vec3 ray, vec3 boxMin, vec3 boxMax) {
+  vec3 tMin = (boxMin - origin) / ray;
+  vec3 tMax = (boxMax - origin) / ray;
+  vec3 t1 = min(tMin, tMax);
+  vec3 t2 = max(tMin, tMax);
+  float tNear = max(max(t1.x, t1.y), t1.z);
+  float tFar = min(min(t2.x, t2.y), t2.z);
+  return vec2(tNear, tFar);
+}
+```
+
+This function intersects a ray with an axis-aligned box.
+
+The box is described by two corners:
+
+- `boxMin` = minimum x, y, z
+- `boxMax` = maximum x, y, z
+
+The ray is described in parametric form as:
+
+```text
+P(t) = origin + ray * t
+```
+
+So the goal is to find the values of `t` where the ray enters and exits the box.
+
+#### Step 1 — Intersect the ray with the box planes
+
+```glsl
+vec3 tMin = (boxMin - origin) / ray;
+vec3 tMax = (boxMax - origin) / ray;
+```
+
+For each axis, this computes where the ray hits the two planes on that axis.
+
+For example, along x:
+
+```text
+t = (box plane x - ray origin x) / ray direction x
+```
+
+The same is done for y and z.
+
+So after these two lines we have:
+
+- one candidate `t` for the “low” plane on each axis
+- one candidate `t` for the “high” plane on each axis
+
+#### Step 2 — Sort near and far for each axis
+
+```glsl
+vec3 t1 = min(tMin, tMax);
+vec3 t2 = max(tMin, tMax);
+```
+
+A ray can point in either positive or negative directions, so the smaller value is not always in `tMin`.
+
+These lines sort the two intersection distances per axis into:
+
+- `t1` = near hit on that axis
+- `t2` = far hit on that axis
+
+#### Step 3 — Compute the overall entry and exit points
+
+```glsl
+float tNear = max(max(t1.x, t1.y), t1.z);
+float tFar = min(min(t2.x, t2.y), t2.z);
+```
+
+To actually be inside the box, the ray must be inside the x slab, the y slab, and the z slab at the same time.
+
+So:
+
+- the ray **enters** the box at the largest of the three near distances
+- the ray **exits** the box at the smallest of the three far distances
+
+That gives:
+
+- `tNear` = first point where the ray is inside all three slabs
+- `tFar` = last point where the ray is still inside all three slabs
+
+#### Return value
+
+```glsl
+return vec2(tNear, tFar);
+```
+
+So the function returns both distances:
+
+- `.x` = entry distance
+- `.y` = exit distance
+
+In this tutorial we mainly use `tFar`, because the refracted ray starts near the water surface and continues through the pool until it hits the far interior wall or floor.
+
+---
+
+### `poolColor(point)`
+
+```glsl
+vec3 poolColor(vec3 point) {
+  vec3 wall = vec3(0.75, 0.85, 0.95);
+  vec3 floor = vec3(0.55, 0.7, 0.9);
+  if (abs(point.y + 1.0) < 0.01) return floor;
+  return wall;
+}
+```
+
+This function gives a simple color for the pool interior at the point where a ray hits it.
+
+At this stage of the tutorial, we are not yet rendering detailed pool geometry, tiles, or textures.
+
+So instead we fake the pool interior with two flat colors:
+
+- one color for the floor
+- one color for the walls
+
+#### Floor test
+
+```glsl
+if (abs(point.y + 1.0) < 0.01) return floor;
+```
+
+The pool floor is assumed to lie near:
+
+```text
+y = -1
+```
+
+So this line checks whether the hit point is very close to that height.
+
+Why `+ 1.0`?
+
+Because if `point.y == -1.0`, then:
+
+```text
+point.y + 1.0 == 0.0
+```
+
+and the absolute value is tiny.
+
+The `0.01` threshold is just a small tolerance so we do not depend on an exact floating-point match.
+
+#### Otherwise, treat it as a wall
+
+```glsl
+return wall;
+```
+
+If the hit point is not on the floor, we treat it as one of the side walls.
+
+So `poolColor()` is a very simple stand-in for the more detailed pool rendering that comes later.
+
+---
+
+### `traceSceneColor(origin, ray, waterTint)`
+
+```glsl
+vec3 traceSceneColor(vec3 origin, vec3 ray, vec3 waterTint) {
+  vec2 t = intersectBox(origin, ray, vec3(-1.0, -1.0, -1.0), vec3(1.0, 2.0, 1.0));
+
+  if (ray.y > 0.0) {
+    vec3 skyColor = textureCube(sky, ray).rgb;
+    return skyColor;
+  }
+
+  vec3 hit = origin + ray * t.y;
+  return poolColor(hit) * waterTint;
+}
+```
+
+This is the main scene-query helper.
+
+Its job is:
+
+- take a ray
+- decide whether it sees the sky or the pool interior
+- return the corresponding color
+
+#### Step 1 — Intersect the ray with the pool box
+
+```glsl
+vec2 t = intersectBox(origin, ray, vec3(-1.0, -1.0, -1.0), vec3(1.0, 2.0, 1.0));
+```
+
+This defines a simple box-shaped pool volume.
+
+So now we know where the ray would enter and leave that volume.
+
+#### Step 2 — Upward rays see the sky
+
+```glsl
+if (ray.y > 0.0) {
+  vec3 skyColor = textureCube(sky, ray).rgb;
+  return skyColor;
+}
+```
+
+If the ray points upward, we treat it as looking out into the environment.
+
+So we sample the cubemap in the ray direction and return that color.
+
+This is how reflected rays produce sky reflections.
+
+#### Step 3 — Downward rays hit the pool interior
+
+```glsl
+vec3 hit = origin + ray * t.y;
+```
+
+If the ray points downward, we assume it travels into the pool.
+
+We already know the entry and exit distances from `intersectBox()`.
+
+Here we use `t.y`, the far intersection distance, to find the point where the ray exits the pool box on the opposite interior surface.
+
+That gives us the hit point in 3D.
+
+#### Step 4 — Color the interior surface and tint it
+
+```glsl
+return poolColor(hit) * waterTint;
+```
+
+Finally, we evaluate the pool color at that hit point and multiply by a tint.
+
+That tint lets the same helper be used in slightly different optical situations:
+
+- above-water rays can tint the pool view one way
+- underwater rays can tint it another way
+
+So `traceSceneColor()` is the bridge between abstract rays and visible scene color.
+
+It is the function that lets the water shader say:
+
+- “What does the reflected ray see?”
+- “What does the refracted ray see?”
+
+without having to repeat all the scene-intersection logic inline.
+
+---
+
+### Why these helpers matter
+
+These three helpers work together as a small ray-tracing toolkit inside the fragment shader:
+
+- `intersectBox()` finds where a ray crosses the pool volume
+- `poolColor()` assigns a simple material color to the hit surface
+- `traceSceneColor()` decides whether the ray sees sky or pool and returns the final color
+
+That is what makes the reflection and refraction code manageable.
+
+The main shader computes the rays.
+
+The helper block answers what those rays hit.
 
 ---
 
@@ -1112,6 +1388,8 @@ window.onload = function() {
 };
 
 function animate() {
+
+  gl.disable(gl.DEPTH_TEST);
 
   water.stepSimulation();
   water.stepSimulation();
