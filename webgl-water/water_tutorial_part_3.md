@@ -869,45 +869,616 @@ The helper block answers what those rays hit.
 
 ---
 
-## 5.2 — Shared vertex shader
+## 5.2 — Shared Vertex Shader
+
+In Part 2, the water renderer used a single shader program that did both:
+
+- vertex displacement
+- simple lighting setup
+
+The vertex shader looked like this:
 
 ```javascript
-var vertexShader = '...';
+this.waterShader = new GL.Shader('\
+  uniform sampler2D water;\
+  varying vec3 position;\
+  varying vec3 normal;\
+  void main() {\
+    vec4 info = texture2D(water, gl_Vertex.xy * 0.5 + 0.5);\
+    position = gl_Vertex.xzy;\
+    position.y += info.r;\
+    normal = vec3(info.b, sqrt(1.0 - dot(info.ba, info.ba)), info.a);\
+    gl_Position = gl_ModelViewProjectionMatrix * vec4(position, 1.0);\
+  }\
+', '...fragment shader...');
 ```
 
-This still does only water displacement.
+That made sense in Part 2, because the fragment shader was very simple. It just needed a normal and a light direction for Lambert shading.
 
-That part did **not** fundamentally change from Part 2.
+In Part 3, the fragment shader becomes much more sophisticated. It now needs to compute:
 
-It still:
+- reflection
+- refraction
+- Fresnel blending
+- different behavior above and below the surface
 
-- samples the water texture
-- remaps the plane from XY into XZ
-- adds `info.r` to `position.y`
-- projects the displaced vertex
+That changes what the fragment shader needs as input.
+
+Instead of receiving a normal computed in the vertex shader, the Part 3 fragment shader re-samples the water texture and reconstructs the normal per-fragment. That is more accurate for optical effects, because reflection and refraction are very sensitive to the exact normal direction.
+
+So the vertex shader gets simpler.
 
 ---
 
-## 5.3 — Two fragment shaders built in a loop
+### Part 2 vertex shader
+
+```glsl
+uniform sampler2D water;
+varying vec3 position;
+varying vec3 normal;
+
+void main() {
+  vec4 info = texture2D(water, gl_Vertex.xy * 0.5 + 0.5);
+  position = gl_Vertex.xzy;
+  position.y += info.r;
+  normal = vec3(info.b, sqrt(1.0 - dot(info.ba, info.ba)), info.a);
+  gl_Position = gl_ModelViewProjectionMatrix * vec4(position, 1.0);
+}
+```
+
+### Part 3 vertex shader
+
+```glsl
+uniform sampler2D water;
+varying vec3 position;
+
+void main() {
+  vec4 info = texture2D(water, gl_Vertex.xy * 0.5 + 0.5);
+  position = gl_Vertex.xzy;
+  position.y += info.r;
+  gl_Position = gl_ModelViewProjectionMatrix * vec4(position, 1.0);
+}
+```
+
+---
+
+### Code delta
+
+Here is the exact conceptual delta from Part 2 to Part 3:
+
+#### Part 2
+
+```glsl
+uniform sampler2D water;
+varying vec3 position;
+varying vec3 normal;
+
+void main() {
+  vec4 info = texture2D(water, gl_Vertex.xy * 0.5 + 0.5);
+  position = gl_Vertex.xzy;
+  position.y += info.r;
+  normal = vec3(info.b, sqrt(1.0 - dot(info.ba, info.ba)), info.a);
+  gl_Position = gl_ModelViewProjectionMatrix * vec4(position, 1.0);
+}
+```
+
+#### Part 3
+
+```glsl
+uniform sampler2D water;
+varying vec3 position;
+
+void main() {
+  vec4 info = texture2D(water, gl_Vertex.xy * 0.5 + 0.5);
+  position = gl_Vertex.xzy;
+  position.y += info.r;
+  gl_Position = gl_ModelViewProjectionMatrix * vec4(position, 1.0);
+}
+```
+
+#### What changed
+
+We removed:
+
+```glsl
+varying vec3 normal;
+normal = vec3(info.b, sqrt(1.0 - dot(info.ba, info.ba)), info.a);
+```
+
+Everything else stays the same.
+
+---
+
+### Why remove the normal from the vertex shader?
+
+In Part 2, reconstructing the normal in the vertex shader was good enough because the fragment shader only used it for smooth diffuse lighting.
+
+But in Part 3, the normal affects:
+
+- the reflected ray direction
+- the refracted ray direction
+- the Fresnel term
+
+Those are all nonlinear calculations. If we compute the normal per-vertex and then interpolate it across the triangle, we lose detail and can get visibly softer or less accurate optical behavior.
+
+So in Part 3, the vertex shader focuses only on geometry:
+
+1. sample the water height
+2. displace the mesh
+3. pass the displaced position to the fragment shader
+
+Then the fragment shader uses that position to do a fresh water-texture lookup and reconstruct the normal there.
+
+That gives better-looking reflection and refraction.
+
+---
+
+## 5.3 — Two Fragment Shaders Built in a Loop
+
+This is the biggest structural change in Part 3.
+
+In Part 2, the renderer created one water shader:
+
+```javascript
+this.waterShader = new GL.Shader(vertexShaderSource, fragmentShaderSource);
+```
+
+That was enough because the fragment shader only did one job: simple directional lighting.
+
+But in Part 3, water needs to behave differently depending on which side of the surface we are shading.
+
+From above the surface:
+
+- the ray starts in air
+- the refraction ratio is air → water
+- the water tends to look more transparent straight on and more reflective at grazing angles
+
+From below the surface:
+
+- the ray starts in water
+- the refraction ratio is water → air
+- the normal orientation needs to be flipped
+- the underwater appearance is tinted differently
+
+We could write one giant fragment shader full of conditionals, but that would make the code harder to read and harder to explain.
+
+Instead, we build two closely related shaders in a loop.
+
+---
+
+### Part 2 shader structure
+
+In Part 2 the renderer looked like this:
+
+```javascript
+function Renderer() {
+
+  this.waterMesh = GL.Mesh.plane({ detail: 200 });
+
+  this.waterShader = new GL.Shader('\
+    uniform sampler2D water;\
+    varying vec3 position;\
+    varying vec3 normal;\
+    void main() {\
+      vec4 info = texture2D(water, gl_Vertex.xy * 0.5 + 0.5);\
+      position = gl_Vertex.xzy;\
+      position.y += info.r;\
+      normal = vec3(info.b, sqrt(1.0 - dot(info.ba, info.ba)), info.a);\
+      gl_Position = gl_ModelViewProjectionMatrix * vec4(position, 1.0);\
+    }\
+  ', '\
+    uniform vec3 light;\
+    varying vec3 position;\
+    varying vec3 normal;\
+    void main() {\
+      float diffuse = max(0.0, dot(normalize(normal), normalize(light)));\
+      vec3 color = vec3(0.2, 0.6, 1.0) * (0.2 + 0.8 * diffuse);\
+      gl_FragColor = vec4(color, 1.0);\
+    }\
+  ');
+
+}
+```
+
+That is one mesh and one shader program.
+
+---
+
+### Part 3 shader structure
+
+In Part 3, the renderer changes to this:
 
 ```javascript
 this.waterShaders = [];
 
 for (var i = 0; i < 2; i++) {
-  this.waterShaders[i] = new GL.Shader(...);
+  this.waterShaders[i] = new GL.Shader(vertexShader, helperFunctions + '...fragment body...');
 }
 ```
 
-Instead of writing two nearly identical shaders by hand, we construct them in a loop.
+That means:
 
-The shared parts are written once.
+- `this.waterShaders[0]` = one side of the water
+- `this.waterShaders[1]` = the other side of the water
 
-Then the code inserts one of two small side-specific bodies:
+The shaders share:
 
-- `i == 0` → above-water logic
-- `i == 1` → underwater logic
+- the same vertex shader
+- the same helper functions
+- most of the same fragment logic
 
-That is why `this.waterShaders` is an array.
+They differ only in the small section of code that depends on which side of the interface we are rendering.
+
+---
+
+### Code delta: one shader becomes two
+
+#### Part 2
+
+```javascript
+this.waterShader = new GL.Shader(vertexShaderSource, fragmentShaderSource);
+```
+
+#### Part 3
+
+```javascript
+this.waterShaders = [];
+
+for (var i = 0; i < 2; i++) {
+  this.waterShaders[i] = new GL.Shader(vertexShader, helperFunctions + '...fragment body...');
+}
+```
+
+#### What changed
+
+Instead of one shader object:
+
+```javascript
+this.waterShader
+```
+
+we now create an array:
+
+```javascript
+this.waterShaders
+```
+
+And instead of writing one fragment shader, we generate two variants.
+
+---
+
+### Full Part 3 pattern
+
+Here is the full structure again:
+
+```javascript
+this.waterShaders = [];
+
+for (var i = 0; i < 2; i++) {
+  this.waterShaders[i] = new GL.Shader(vertexShader, helperFunctions + '\
+    uniform vec3 eye;\
+    varying vec3 position;\
+    \
+    vec3 readNormal(vec3 pos) {\
+      vec2 coord = pos.xz * 0.5 + 0.5;\
+      vec4 info = texture2D(water, coord);\
+      \
+      for (int j = 0; j < 5; j++) {\
+        coord += info.ba * 0.005;\
+        info = texture2D(water, coord);\
+      }\
+      \
+      return vec3(info.b, sqrt(1.0 - dot(info.ba, info.ba)), info.a);\
+    }\
+    \
+    void main() {\
+      vec3 normal = readNormal(position);\
+      vec3 incomingRay = normalize(position - eye);\
+    ' + (i ? '\
+      normal = -normal;\
+      vec3 reflectedRay = reflect(incomingRay, normal);\
+      vec3 refractedRay = refract(incomingRay, normal, IOR_WATER / IOR_AIR);\
+      float fresnel = mix(0.5, 1.0, pow(1.0 - dot(normal, -incomingRay), 3.0));\
+      vec3 reflectedColor = traceSceneColor(position, reflectedRay, UNDER_WATER_TINT);\
+      vec3 refractedColor = traceSceneColor(position, refractedRay, vec3(1.0));\
+      gl_FragColor = vec4(mix(reflectedColor, refractedColor, (1.0 - fresnel) * length(refractedRay)), 1.0);\
+    ' : '\
+      vec3 reflectedRay = reflect(incomingRay, normal);\
+      vec3 refractedRay = refract(incomingRay, normal, IOR_AIR / IOR_WATER);\
+      float fresnel = mix(0.25, 1.0, pow(1.0 - dot(normal, -incomingRay), 3.0));\
+      vec3 reflectedColor = traceSceneColor(position, reflectedRay, ABOVE_WATER_TINT);\
+      vec3 refractedColor = traceSceneColor(position, refractedRay, ABOVE_WATER_TINT);\
+      gl_FragColor = vec4(mix(refractedColor, reflectedColor, fresnel), 1.0);\
+    ') + '\
+    }\
+  ');
+}
+```
+
+At first glance this can look intimidating, so it helps to break it into layers.
+
+---
+
+### Layer 1 — Shared fragment code
+
+The first part of the fragment shader is the same in both variants:
+
+```glsl
+uniform vec3 eye;
+varying vec3 position;
+
+vec3 readNormal(vec3 pos) {
+  vec2 coord = pos.xz * 0.5 + 0.5;
+  vec4 info = texture2D(water, coord);
+
+  for (int j = 0; j < 5; j++) {
+    coord += info.ba * 0.005;
+    info = texture2D(water, coord);
+  }
+
+  return vec3(info.b, sqrt(1.0 - dot(info.ba, info.ba)), info.a);
+}
+
+void main() {
+  vec3 normal = readNormal(position);
+  vec3 incomingRay = normalize(position - eye);
+  ...
+}
+```
+
+This shared code does three important things.
+
+#### 1. It receives the eye position
+
+```glsl
+uniform vec3 eye;
+```
+
+The fragment shader needs the camera position in order to compute the incoming viewing ray.
+
+#### 2. It reconstructs the normal per-fragment
+
+```glsl
+vec3 normal = readNormal(position);
+```
+
+This replaces the old Part 2 approach of passing a normal from the vertex shader.
+
+The helper `readNormal()` samples the water texture using the displaced surface position and reconstructs the normal there.
+
+That gives more accurate normals for reflection and refraction.
+
+#### 3. It computes the incoming viewing ray
+
+```glsl
+vec3 incomingRay = normalize(position - eye);
+```
+
+This ray points from the eye toward the surface point being shaded.
+
+That is the ray we feed into `reflect()` and `refract()`.
+
+---
+
+### Why `readNormal()` exists
+
+This helper was not needed in Part 2.
+
+In Part 3 it appears because optical shading needs more precise normals than simple diffuse lighting.
+
+The function does:
+
+```glsl
+vec2 coord = pos.xz * 0.5 + 0.5;
+vec4 info = texture2D(water, coord);
+```
+
+which maps the displaced water-surface position back into water-texture coordinates.
+
+Then it does a few small offset steps:
+
+```glsl
+for (int j = 0; j < 5; j++) {
+  coord += info.ba * 0.005;
+  info = texture2D(water, coord);
+}
+```
+
+The loop does not change the simulated water height. It only changes **where we sample the normal from for shading**. At each step, the lookup coordinate is nudged a little in the horizontal direction indicated by the current normal, then the texture is sampled again. That means the shader is not using the normal exactly at the current point, but a normal gathered slightly farther along the local slope. Visually, this biases the shading toward stronger slope changes near wave crests, so reflections and highlights transition more tightly instead of being spread smoothly across a broad rounded hump. In that sense the waves look **sharper**.
+
+After that it reconstructs the full normal:
+
+```glsl
+return vec3(info.b, sqrt(1.0 - dot(info.ba, info.ba)), info.a);
+```
+
+So `readNormal()` is a fragment-side replacement for the simpler normal reconstruction that Part 2 did in the vertex shader.
+
+---
+
+### Layer 2 — Above-water branch
+
+When `i == 0`, the loop inserts this body:
+
+```glsl
+vec3 reflectedRay = reflect(incomingRay, normal);
+vec3 refractedRay = refract(incomingRay, normal, IOR_AIR / IOR_WATER);
+float fresnel = mix(0.25, 1.0, pow(1.0 - dot(normal, -incomingRay), 3.0));
+vec3 reflectedColor = traceSceneColor(position, reflectedRay, ABOVE_WATER_TINT);
+vec3 refractedColor = traceSceneColor(position, refractedRay, ABOVE_WATER_TINT);
+gl_FragColor = vec4(mix(refractedColor, reflectedColor, fresnel), 1.0);
+```
+
+This is the top-of-water case.
+
+#### Why it changed from Part 2
+
+In Part 2, the fragment shader simply did:
+
+```glsl
+float diffuse = max(0.0, dot(normalize(normal), normalize(light)));
+vec3 color = vec3(0.2, 0.6, 1.0) * (0.2 + 0.8 * diffuse);
+gl_FragColor = vec4(color, 1.0);
+```
+
+That was a lighting model.
+
+In Part 3, we replace that with an optical model:
+
+- compute reflected direction
+- compute refracted direction
+- look up colors for both
+- blend them using Fresnel
+
+#### Why `IOR_AIR / IOR_WATER`?
+
+Because in this pass the ray starts in air and bends into water.
+
+That is the physical direction of transmission for the above-water view.
+
+#### Why mix refraction and reflection?
+
+Looking straight down at water, you usually see more into the water.
+
+Looking across it at a shallow angle, you see stronger reflections.
+
+That angle-dependent blend is one of the biggest visual cues that a surface is water.
+
+---
+
+### Layer 3 — Underwater branch
+
+When `i == 1`, the loop inserts this body:
+
+```glsl
+normal = -normal;
+vec3 reflectedRay = reflect(incomingRay, normal);
+vec3 refractedRay = refract(incomingRay, normal, IOR_WATER / IOR_AIR);
+float fresnel = mix(0.5, 1.0, pow(1.0 - dot(normal, -incomingRay), 3.0));
+vec3 reflectedColor = traceSceneColor(position, reflectedRay, UNDER_WATER_TINT);
+vec3 refractedColor = traceSceneColor(position, refractedRay, vec3(1.0));
+gl_FragColor = vec4(mix(reflectedColor, refractedColor, (1.0 - fresnel) * length(refractedRay)), 1.0);
+```
+
+This is the underside-of-water case.
+
+#### Why flip the normal?
+
+The water surface normal was reconstructed in its default orientation, appropriate for the top surface.
+
+When shading the underside, we want the normal to face the other way, so we flip it:
+
+```glsl
+normal = -normal;
+```
+
+#### Why reverse the IOR ratio?
+
+Now the ray is traveling from water toward air, so the transmission ratio changes to:
+
+```glsl
+IOR_WATER / IOR_AIR
+```
+
+That is the physically appropriate direction for the underwater pass.
+
+#### Why does this branch look a little different?
+
+Underwater visuals are not just the same thing with the camera moved below the surface.
+
+The balance between reflected and refracted light changes, and the tint is different.
+
+So this branch uses:
+
+- a different Fresnel baseline
+- a different tint
+- a slightly different blend expression
+
+That is exactly the kind of difference that would make a single giant shader harder to read.
+
+---
+
+### Why build the shaders in a loop?
+
+Because most of the code is identical.
+
+Both shader variants need:
+
+- the same `eye` uniform
+- the same `position` varying
+- the same `readNormal()` helper
+- the same reflection/refraction structure
+- the same helper block
+
+Only a small middle section changes:
+
+- normal flip or not
+- air→water vs water→air
+- above-water tint vs underwater tint
+- slightly different Fresnel and final blend
+
+So instead of duplicating dozens of lines twice, we generate the two versions programmatically.
+
+That makes the code shorter while still keeping the two cases visibly separate.
+
+---
+
+### Why this is better than branching inside one shader
+
+You might wonder why not do something like:
+
+```glsl
+if (underwater) {
+  ...
+} else {
+  ...
+}
+```
+
+That would work, but this tutorial intentionally follows the structure of the reference code, where the renderer builds multiple related shaders by combining shared GLSL with small variant-specific sections.
+
+That has a few advantages:
+
+- the above-water and underwater cases stay clearly separated
+- shared code is not duplicated
+- the render loop can select the shader by pass
+- it matches the mental model of “two-sided water rendering”
+
+So the renderer organization becomes:
+
+- shared vertex shader
+- shared helper block
+- two fragment shader variants
+- two render passes with opposite face culling
+
+That is the core architectural change in Part 3.
+
+---
+
+### Summary of what changed from Part 2
+
+Part 2 used one water shader with a simple fragment lighting model.
+
+Part 3 replaces that with two shaders built from shared pieces.
+
+#### Part 2
+
+- one shader
+- normal reconstructed in vertex shader
+- fragment shader does Lambert lighting
+
+#### Part 3
+
+- one shared vertex shader
+- one shared helper block
+- two fragment shader variants
+- normal reconstructed in fragment shader
+- fragment shader computes reflection, refraction, and Fresnel
+- render loop draws the water twice, once per side
+
+That is why this section matters so much.
+
+It is the point where the renderer stops being “draw a blue displaced mesh” and becomes “shade a refractive reflective interface.”
 
 ---
 
