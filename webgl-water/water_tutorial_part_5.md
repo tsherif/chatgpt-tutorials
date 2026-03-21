@@ -164,21 +164,25 @@ First, add `causticTex` to the uniform declarations at the top of the block:
 
 ### Part 4
 ```glsl
+uniform sampler2D water;
+uniform samplerCube sky;
+uniform sampler2D tiles;
 uniform vec3 light;
 uniform vec3 sphereCenter;
 uniform float sphereRadius;
-uniform sampler2D tiles;
-uniform sampler2D water;
+uniform vec3 underwaterColor;
 ```
 
 ### Part 5
 ```glsl
+uniform sampler2D water;
+uniform samplerCube sky;
+uniform sampler2D caustiTex;
+uniform sampler2D tiles;
 uniform vec3 light;
 uniform vec3 sphereCenter;
 uniform float sphereRadius;
-uniform sampler2D tiles;
-uniform sampler2D causticTex;
-uniform sampler2D water;
+uniform vec3 underwaterColor;
 ```
 
 Second, update `getSphereColor()` and `getWallColor()` to sample and apply the caustic texture. These are the most significant changes in Part 5. The full updated versions of both functions are shown below with explanation.
@@ -225,7 +229,7 @@ vec3 getSphereColor(vec3 point) {
 
 ### What changed and why
 
-**Ambient occlusion** is new. The three `color *=` lines darken the sphere as it approaches the pool walls and floor. Each line computes a proximity factor for one boundary — the x walls, the z walls, and the floor — and multiplies it into the color. This is analytic ambient occlusion: it uses the geometry of the scene to estimate how much ambient light would be blocked, without any additional render passes.
+**Ambient occlusion**: The three `color *=` lines darken the sphere as it approaches the pool walls and floor. Each line computes a proximity factor for one boundary — the x walls, the z walls, and the floor — and multiplies it into the color. This is analytic ambient occlusion: it uses the geometry of the scene to estimate how much ambient light would be blocked, without any additional render passes.
 
 Each line darkens the sphere based on its proximity to one of the pool boundaries — the x walls, the z walls, and the floor.
 
@@ -234,7 +238,7 @@ Take the first line as an example:
 color *= 1.0 - 0.9 / pow((1.0 + sphereRadius - abs(point.x)) / sphereRadius, 3.0);
 ```
 
-The pool walls sit at `x = ±1`. `abs(point.x)` is the distance of the sphere surface point from the center along x, so `1.0 - abs(point.x)` is how far that point is from the nearest x wall. Adding `sphereRadius` gives a measure of how close the sphere as a whole is to that wall — when the sphere is just touching the wall, `1.0 + sphereRadius - abs(point.x)` equals `sphereRadius` at the contact point, and larger than `sphereRadius` everywhere else.
+The pool walls sit at `x = ±1`. `abs(point.x)` is the distance of the sphere surface point from the center along x, so `1.0 - abs(point.x)` is how far that point is from the nearest x wall. Adding `sphereRadius` term isn't physically derived but makes the spatial extent of the darkening  proportional to the size of the sphere, which is desirable. When the sphere is just touching the wall, `1.0 + sphereRadius - abs(point.x)` equals `sphereRadius` at the contact point, and larger than `sphereRadius` everywhere else.
 
 Dividing by `sphereRadius` normalizes this so that the value is `1.0` at the contact point and grows larger as the sphere moves away. Call this normalized distance `d`.
 
@@ -328,7 +332,7 @@ vec3 getWallColor(vec3 point) {
 
 **The lighting model is restructured** around a `scale` value that accumulates all lighting contributions multiplicatively, rather than computing a single diffuse term at the end.
 
-**Pool ambient occlusion** (`scale /= length(point)`) darkens wall and floor fragments that are closer to the center of the pool. Fragments near the corners and edges are further from the origin, so they receive a smaller darkening factor. This is a crude but effective approximation of how light bouncing around inside the pool would be attenuated near its interior.
+**Pool ambient occlusion** Pool ambient occlusion (`scale /= length(point)`) darkens wall and floor fragments that are further from the center of the pool. Points near corners and edges have a larger `length(point)`, which divides scale more strongly, approximating the enclosure of those regions by surrounding geometry.
 
 **Sphere ambient occlusion** (`scale *= 1.0 - 0.9 / pow(...)`) darkens wall and floor fragments that are close to the sphere. This simulates the sphere blocking ambient light from reaching those nearby surfaces.
 
@@ -336,10 +340,29 @@ vec3 getWallColor(vec3 point) {
 ```glsl
 scale += diffuse * caustic.r * 2.0 * caustic.g;
 ```
+Also note that `refractedLight` is negated here compared to `getSphereColor()` but the projection ends up being equivalent.
 
 `caustic.r` is the brightness ratio computed in the caustics vertex shader. `caustic.g` is a sphere shadow mask also computed there — it is close to 0 where the sphere is blocking the light and 1 elsewhere. Multiplying by both means caustics are darkened where the sphere casts a shadow, which produces the correct soft shadow underneath the sphere.
 
-**Above-water surfaces** use a different path. When `point.y >= info.r`, the wall or floor fragment is above the waterline and should not receive caustic lighting. Instead it receives a soft shadow from the pool rim — a logistic function that fades lighting out at the point where the refracted ray would emerge from the pool. This prevents the top edges of the pool walls from being lit as if they were underwater.
+**Above-water surfaces** use a different path. When a wall or floor fragment is above the waterline it does not receive caustic light, but it can still receive direct diffuse light from the sun — unless the pool rim is blocking it.
+
+The pool rim sits at a fixed height near the top of the pool walls. A fragment that is close to the waterline but just above it might have a very short path between itself and the open sky, meaning the rim of the pool could be cutting off the light. This block computes a soft shadow for that case.
+```glsl
+vec2 t = intersectCube(point, refractedLight, vec3(-1.0, -poolHeight, -1.0), vec3(1.0, 2.0, 1.0));
+```
+
+This traces the refracted light ray from the surface point upward through the pool volume. `t.x` and `t.y` are the entry and exit distances along that ray. Since `refractedLight` points upward here, `t.y` is the distance to where the ray exits the pool box — the point where it would emerge from the top of the pool.
+```glsl
+diffuse *= 1.0 / (1.0 + exp(-200.0 / (1.0 + 10.0 * (t.y - t.x)) * (point.y + refractedLight.y * t.y - 2.0 / 12.0)));
+```
+
+This is a logistic (sigmoid) function that produces a smooth 0-to-1 transition. The argument inside the exponent has two parts:
+
+`t.y - t.x` is the total length of the ray's path through the pool volume. A longer path through the pool means the ray exits at a shallower angle — the pool rim is less likely to be cutting it off, so the shadow should be softer. The `10.0 * (t.y - t.x)` term in the denominator widens the transition for shallower rays.
+
+`point.y + refractedLight.y * t.y` is the y coordinate of the point where the ray exits the pool box. Subtracting `2.0 / 12.0` compares that exit point against the rim height. If the ray exits below the rim, the fragment is in shadow; if it exits above, it is lit.
+
+The `200.0` coefficient makes the transition very steep, so the shadow edge is sharp rather than gradual. The overall effect is a crisp shadow line along the pool rim that fades slightly for rays traveling at shallow angles through the water.
 
 ---
 
